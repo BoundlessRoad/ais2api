@@ -41,6 +41,7 @@ class AuthSource {
       );
       throw new Error("No valid authentication sources found.");
     }
+
   }
 
   _discoverAvailableIndices() {
@@ -75,15 +76,15 @@ class AuthSource {
       }
     }
 
-    // 存取扫描到的原始索引
+    // 将扫描到的原始索引存起来
     this.initialIndices = [...new Set(indices)].sort((a, b) => a - b);
     this.availableIndices = [...this.initialIndices]; // 先假设都可用
 
     this.logger.info(
-      `[Auth] 在 '${this.authMode}' 模式下，初步发现 ${
-        this.initialIndices.length
+      `[Auth] 在 '${this.authMode}' 模式下，初步发现 ${this.initialIndices.length
       } 个认证源: [${this.initialIndices.join(", ")}]`
     );
+
   }
 
   _preValidateAndFilter() {
@@ -114,8 +115,7 @@ class AuthSource {
 
     if (invalidSourceDescriptions.length > 0) {
       this.logger.warn(
-        `⚠️ [Auth] 预检验发现 ${
-          invalidSourceDescriptions.length
+        `⚠️ [Auth] 预检验发现 ${invalidSourceDescriptions.length
         } 个格式错误或无法读取的认证源: [${invalidSourceDescriptions.join(
           ", "
         )}]，将从可用列表中移除。`
@@ -123,6 +123,7 @@ class AuthSource {
     }
 
     this.availableIndices = validIndices;
+
   }
 
   // 一个内部辅助函数，仅用于预检验，避免日志污染
@@ -160,6 +161,7 @@ class AuthSource {
       );
       return null;
     }
+
   }
 }
 // ===================================================================================
@@ -176,7 +178,8 @@ class BrowserManager {
     this.page = null;
     this.currentAuthIndex = 0;
     this.scriptFileName = "black-browser.js";
-    this.noButtonCount = 0;
+    this.scavengerInterval = null;
+    // [优化] 为低内存的Docker/云环境设置优化的启动参数
     this.launchArgs = [
       "--disable-dev-shm-usage", // 关键！防止 /dev/shm 空间不足导致浏览器崩溃
       "--disable-gpu",
@@ -198,26 +201,442 @@ class BrowserManager {
     } else {
       const platform = os.platform();
       if (platform === "linux") {
-        this.browserExecutablePath = path.join(
-          __dirname,
-          "camoufox-linux",
-          "camoufox"
-        );
+        this.browserExecutablePath = path.join(__dirname, "camoufox-linux", "camoufox");
+      } else if (platform === "win32") {
+        // 这里指向你刚才放好的 camoufox 文件夹
+        this.browserExecutablePath = path.join(__dirname, "camoufox", "camoufox.exe");
       } else {
         throw new Error(`Unsupported operating system: ${platform}`);
       }
     }
-  }
 
+  }
   notifyUserActivity() {
     if (this.noButtonCount > 0) {
-      this.logger.info(
-        "[Browser] ⚡ 收到用户请求信号，强制唤醒后台检测 (重置计数器)"
-      );
+      this.logger.info("[Browser] ⚡ 收到用户请求，强制唤醒Launch检测");
       this.noButtonCount = 0;
     }
   }
+  // [新增] 作者的后台唤醒与 "Launch" 按钮处理逻辑
+  // 这个方法将作为一个独立的后台任务运行，专门解决遮罩问题
+  async _startBackgroundWakeup() {
+    const currentPage = this.page;
+    // 1. 启动缓冲
+    await new Promise((r) => setTimeout(r, 1500));
 
+    if (!currentPage || currentPage.isClosed() || this.page !== currentPage)
+      return;
+
+    this.logger.info("[Browser] (后台任务) 🛡️ 网页保活监控已启动");
+
+    let noButtonCount = 0;
+
+    while (
+      currentPage &&
+      !currentPage.isClosed() &&
+      this.page === currentPage
+    ) {
+      try {
+        // --- [增强步骤 1] 强制唤醒页面 (解决不发请求不刷新的问题) ---
+        await currentPage.bringToFront().catch(() => { });
+
+        // 关键：在无头模式下，仅仅 bringToFront 可能不够，需要伪造鼠标移动来触发渲染帧
+        // 随机在一个无害区域轻微晃动鼠标
+        await currentPage.mouse.move(10, 10);
+        await currentPage.mouse.move(20, 20);
+
+        // --- [增强步骤 2] 智能查找 (查找文本并向上锁定可交互父级) ---
+        const targetInfo = await currentPage.evaluate(() => {
+          // [融合作者的策略1：精准CSS定位]
+          try {
+            const preciseCandidates = Array.from(document.querySelectorAll('.interaction-modal p, .interaction-modal button'));
+            for (const el of preciseCandidates) {
+              if (/Launch|rocket_launch/i.test((el.innerText || '').trim())) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) {
+                  return { found: true, x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, tagName: el.tagName, text: (el.innerText || '').trim().substring(0, 15) };
+                }
+              }
+            }
+          } catch (e) { }
+          // 定义 Y 轴安全区 (避免误触右上角)
+          const MIN_Y = 400;
+          const MAX_Y = 800;
+
+          // 辅助函数：判断元素是否可见且在区域内
+          const isValid = (rect) => {
+            return (
+              rect.width > 0 &&
+              rect.height > 0 &&
+              rect.top > MIN_Y &&
+              rect.top < MAX_Y
+            );
+          };
+
+          // 扫描所有包含关键词的元素
+          const candidates = Array.from(
+            document.querySelectorAll("button, span, div, a, i") // 加入 i 标签以防图标
+          );
+
+          for (const el of candidates) {
+            const text = (el.innerText || "").trim();
+            // 匹配 Launch 或 rocket_launch 图标名
+            if (!/Launch|rocket_launch/i.test(text)) continue;
+
+            let targetEl = el;
+            let rect = targetEl.getBoundingClientRect();
+
+            // [关键优化] 如果当前元素很小或是纯文本容器，尝试向上找 3 层父级
+            let parentDepth = 0;
+            while (parentDepth < 3 && targetEl.parentElement) {
+              if (
+                targetEl.tagName === "BUTTON" ||
+                targetEl.getAttribute("role") === "button"
+              ) {
+                break;
+              }
+              const parent = targetEl.parentElement;
+              const pRect = parent.getBoundingClientRect();
+              if (isValid(pRect)) {
+                targetEl = parent;
+                rect = pRect;
+              }
+              parentDepth++;
+            }
+
+            // 最终检查
+            if (isValid(rect)) {
+              return {
+                found: true,
+                x: rect.left + rect.width / 2,
+                y: rect.top + rect.height / 2,
+                tagName: targetEl.tagName,
+                text: text.substring(0, 15),
+                className: targetEl.className,
+              };
+            }
+          }
+          return { found: false };
+        });
+
+        // --- [增强步骤 3] 执行操作 ---
+        if (targetInfo.found) {
+          noButtonCount = 0; // 重置计数
+          this.logger.info(
+            `[Browser] 🎯 锁定目标 [${targetInfo.tagName}] "${targetInfo.text
+            }" @ (${Math.round(targetInfo.x)}, ${Math.round(targetInfo.y)})`
+          );
+
+          // === 策略 A: 物理点击 (模拟真实鼠标) ===
+          await currentPage.mouse.move(targetInfo.x, targetInfo.y, { steps: 5 });
+          await new Promise((r) => setTimeout(r, 300));
+          await currentPage.mouse.down();
+          await new Promise((r) => setTimeout(r, 400));
+          await currentPage.mouse.up();
+
+          this.logger.info(`[Browser] 🖱️ 物理点击已执行，验证结果...`);
+          await new Promise((r) => setTimeout(r, 1500));
+
+          // === 策略 B: JS 补刀 (如果物理点击失败) ===
+          const isStillThere = await currentPage.evaluate(() => {
+            const els = Array.from(
+              document.querySelectorAll('button, span, div[role="button"]')
+            );
+            return els.some((el) => {
+              const r = el.getBoundingClientRect();
+              return (
+                /Launch|rocket_launch/i.test(el.innerText) &&
+                r.top > 400 &&
+                r.top < 800 &&
+                r.height > 0
+              );
+            });
+          });
+
+          if (isStillThere) {
+            this.logger.warn(
+              `[Browser] ⚠️ 物理点击似乎无效（按钮仍在），尝试 JS 强力点击...`
+            );
+            await currentPage.evaluate(() => {
+              const MIN_Y = 400;
+              const MAX_Y = 800;
+              const candidates = Array.from(
+                document.querySelectorAll('button, span, div[role="button"]')
+              );
+              for (const el of candidates) {
+                const r = el.getBoundingClientRect();
+                if (
+                  /Launch|rocket_launch/i.test(el.innerText) &&
+                  r.top > MIN_Y &&
+                  r.top < MAX_Y
+                ) {
+                  let target = el.closest("button") || el;
+                  target.click();
+                  console.log("[ProxyClient] JS Click triggered on " + target.tagName);
+                  return true;
+                }
+              }
+            });
+            await new Promise((r) => setTimeout(r, 2000));
+          } else {
+            this.logger.info(`[Browser] ✅ 物理点击成功，按钮已消失。`);
+            await new Promise((r) => setTimeout(r, 60000)); // 成功后长休眠
+          }
+        } else {
+          noButtonCount++;
+          // [融合作者的智能休眠逻辑]
+          if (noButtonCount > 20) { // 进入长休眠
+            // 循环等待，但每次等待时间不长，以便能被 notifyUserActivity 快速唤醒
+            for (let i = 0; i < 30; i++) {
+              if (this.noButtonCount === 0) { // 检查是否被唤醒
+                break;
+              }
+              await new Promise((r) => setTimeout(r, 1000)); // 等待1秒
+            }
+          } else { // 正常短休眠
+            await new Promise((r) => setTimeout(r, 1500));
+          }
+        }
+      } catch (e) {
+        // 忽略页面刷新/上下文销毁期间的错误
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    }
+
+  }
+  // [新增] 动态反指纹脚本生成器
+  // 修改生成脚本的方法，接收 authIndex
+  _generateStealthScript(authIndex) {
+    // 基于 authIndex 生成固定的种子，保证该账号每次启动指纹一致
+    let seed = this._stringToSeed(`account_salt_${authIndex}`);
+
+    // 使用种子生成固定的噪声值 (伪随机)
+    const pseudoRandom = () => {
+      const x = Math.sin(seed++) * 10000;
+      return x - Math.floor(x);
+    };
+
+    const noise = Math.floor(pseudoRandom() * 1000);
+    // 固定的 WebGL 厂商列表，根据种子选择一个
+    const vendors = [
+      { vendor: "Intel Inc.", renderer: "Intel Iris OpenGL Engine" },
+      { vendor: "Google Inc. (NVIDIA)", renderer: "ANGLE (NVIDIA, NVIDIA GeForce GTX 1050 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)" },
+      { vendor: "Google Inc. (AMD)", renderer: "ANGLE (AMD, AMD Radeon RX 580 Series Direct3D11 vs_5_0 ps_5_0, D3D11)" }
+    ];
+    const selectedGPU = vendors[Math.floor(pseudoRandom() * vendors.length)];
+
+    return `
+      (function() {
+        try {
+          // 1. 基础特征掩盖
+          Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+          
+          // 2. 伪造插件 (固定长度)
+          if (navigator.plugins.length === 0) {
+            Object.defineProperty(navigator, 'plugins', {
+              get: () => new Array(${3 + Math.floor(pseudoRandom() * 3)}), 
+            });
+          }
+    
+          // 3. WebGL 指纹 (固定为该账号选定的 GPU)
+          const getParameter = WebGLRenderingContext.prototype.getParameter;
+          WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return '${selectedGPU.vendor}';
+            if (parameter === 37446) return '${selectedGPU.renderer}';
+            return getParameter.apply(this, arguments);
+          };
+    
+          // 4. 注入固定噪声变量
+          window['v_noise_${noise}'] = '${noise}';
+          
+          console.log("[Stealth] 静态一致性指纹注入成功: ${selectedGPU.renderer}");
+        } catch (e) {
+          console.error("[Stealth] 注入失败", e);
+        }
+      })();
+    `;
+
+  }
+
+
+  // [新增] 智能点击 "Code" 按钮 (硬编码优先 + 模糊兜底)
+  async _smartClickCode(page) {
+    const selectors = [
+      // 优先级 1: 现有的精准硬编码 (速度最快)
+      'button:text("Code")',
+      // 优先级 2: Google 常用的替代文案
+      'button:text("Develop")',
+      'button:text("Edit")',
+      // 优先级 3: 属性模糊匹配 (防止文案变化)
+      'button[aria-label*="Code"]',
+      'button[aria-label*="code"]',
+      // 优先级 4: 图标类 (假设图标 class 包含 code)
+      'button mat-icon:text("code")',
+      'button span:has-text("Code")'
+    ];
+
+    this.logger.info('[Browser] 正在尝试定位 "Code" 入口...');
+
+    for (const selector of selectors) {
+      try {
+        // 使用较短的超时时间快速试错
+        const element = page.locator(selector).first();
+        if (await element.isVisible({ timeout: 2000 })) {
+          this.logger.info(`[Browser] ✅ 命中选择器: "${selector}"，正在点击...`);
+          await element.click({ timeout: 10000, force: true });
+          return true;
+        }
+      } catch (e) {
+        // 忽略单个选择器的超时，继续尝试下一个
+      }
+    }
+
+    throw new Error('无法找到 "Code" 或其替代按钮 (所有模糊匹配均失败)');
+
+  }
+
+  // [新增] 后台清道夫 (Scavenger) - 持续清理弹窗
+  _startScavenger() {
+    if (this.scavengerInterval) clearInterval(this.scavengerInterval);
+
+    this.logger.info('[Browser] 🧹 启动后台清道夫 (Scavenger) 及保活机制...');
+
+    let tickCount = 0; // 用于计次
+
+    // 每 2 秒巡逻一次
+    this.scavengerInterval = setInterval(async () => {
+      const currentPage = this.page; // 锁定当前页面实例
+      if (!currentPage || currentPage.isClosed()) {
+        clearInterval(this.scavengerInterval);
+        return;
+      }
+
+      tickCount++;
+
+      try {
+        // --- 周期性保活 (Keep-Alive) & 模拟心跳 (Point 4) ---
+        // 增加随机性：不是每次都动，而是有概率动
+        if (Math.random() > 0.3) {
+          try {
+            // 1. 随机微小滚动，模拟用户阅读
+            await currentPage.evaluate(() => {
+              window.scrollBy(0, (Math.random() - 0.5) * 20);
+            });
+
+            // 2. 随机鼠标移动 (Point 2: 鼠标抖动/随机位置)
+            const x = Math.floor(Math.random() * 500);
+            const y = Math.floor(Math.random() * 500);
+            await currentPage.mouse.move(x, y, { steps: 5 });
+          } catch (e) {
+            // 忽略保活错误
+          }
+        }
+
+        // 每 15 个周期 (约30秒) 执行一次点击保活
+        if (tickCount % 15 === 0) {
+          try {
+            // 移动到 (1, 1) 极小角落并点击
+            await currentPage.mouse.move(1, 1, { steps: 5 });
+            await currentPage.mouse.down();
+            await currentPage.waitForTimeout(100 + Math.random() * 100); // Point 2: 随机延迟
+            await currentPage.mouse.up();
+          } catch (e) {
+          }
+        }
+
+
+        await currentPage.evaluate(() => {
+          // 定义要清理的目标特征
+          const targets = [
+            // 1. 遮罩层 (最常见阻挡交互的元素)
+            'div.cdk-overlay-backdrop',
+            // 2. 常见的错误/提示弹窗按钮
+            'button:text("Reload")',      // 网络错误重载
+            'button:text("Retry")',       // 重试
+            'button:text("Got it")',      // 新功能提示
+            'button:text("Dismiss")',     // 忽略
+            'button:text("Not now")',     // 稍后
+            'button[aria-label="Close"]'  // 通用关闭
+          ];
+
+          targets.forEach(selector => {
+            const elements = document.querySelectorAll(selector);
+            elements.forEach(el => {
+              // 只有可见的元素才处理
+              if (el.offsetParent !== null) {
+                console.log(`[Scavenger] 发现干扰元素: ${selector}，正在移除/点击...`);
+                // 对于按钮尝试点击，对于遮罩层直接移除
+                if (el.tagName.toLowerCase() === 'button') {
+                  el.click({ timeout: 300000 });
+                } else {
+                  el.remove();
+                }
+              }
+            });
+          });
+        });
+      } catch (error) {
+        // 忽略错误
+      }
+    }, 4000); // 每4秒执行一次全套守护任务
+
+  }
+
+  // 辅助函数：简单的字符串哈希，用于将 authIndex 转为数字种子
+  _stringToSeed(str) {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return Math.abs(hash);
+  }
+  async _humanMouseMove(page, targetX, targetY) {
+    // 获取当前鼠标位置
+    // 注意：Playwright 没有直接获取当前鼠标位置的 API，我们需要自己记录或假设
+    // 这里为了简单，我们假设从页面中心或上一次位置开始，或者直接让 Playwright 处理路径
+
+    // 更好的方法是使用自定义的贝塞尔路径生成
+    const box = await page.evaluate(() => {
+      return { w: window.innerWidth, h: window.innerHeight };
+    });
+
+    // 简单的贝塞尔曲线生成器
+    const generatePath = (startX, startY, endX, endY) => {
+      const controlX = startX + (endX - startX) / 2 + (Math.random() - 0.5) * 100;
+      const controlY = startY + (endY - startY) / 2 + (Math.random() - 0.5) * 100;
+      const steps = 20 + Math.floor(Math.random() * 15); // 随机步数
+      const path = [];
+      for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        // 二阶贝塞尔公式
+        const x = (1 - t) * (1 - t) * startX + 2 * (1 - t) * t * controlX + t * t * endX;
+        const y = (1 - t) * (1 - t) * startY + 2 * (1 - t) * t * controlY + t * t * endY;
+        path.push({ x, y });
+      }
+      return path;
+    };
+
+    // 由于不知道当前鼠标在哪，我们先瞬移到一个随机附近的点作为起点 (模拟)
+    // 或者直接使用 Playwright 的 move，但拆分成多段
+
+    // 策略：将长距离移动拆分为 2-3 段带有随机偏差的移动
+    const steps = 3;
+    for (let i = 1; i <= steps; i++) {
+      const intermediateX = targetX + (Math.random() - 0.5) * (100 / i);
+      const intermediateY = targetY + (Math.random() - 0.5) * (100 / i);
+
+      // 最后一跳必须精准
+      const destX = i === steps ? targetX : intermediateX;
+      const destY = i === steps ? targetY : intermediateY;
+
+      await page.mouse.move(destX, destY, {
+        steps: 10 + Math.floor(Math.random() * 10) // 随机速度
+      });
+    }
+
+  }
   async launchOrSwitchContext(authIndex) {
     if (!this.browser) {
       this.logger.info("🚀 [Browser] 浏览器实例未运行，正在进行首次启动...");
@@ -239,6 +658,12 @@ class BrowserManager {
       });
       this.logger.info("✅ [Browser] 浏览器实例已成功启动。");
     }
+    if (this.scavengerInterval) {
+      clearInterval(this.scavengerInterval);
+      this.scavengerInterval = null;
+      this.logger.info("[Browser] 已停止旧页面的后台任务 (Scavenger)。"); // 添加日志更清晰
+    }
+
     if (this.context) {
       this.logger.info("[Browser] 正在关闭旧的浏览器上下文...");
       await this.context.close();
@@ -270,11 +695,44 @@ class BrowserManager {
     );
 
     try {
+      // Point 3: 窗口大小随机化 (1920x1080 基础上的微小偏移)
+      const randomWidth = 1920 + Math.floor(Math.random() * 50);
+      const randomHeight = 1080 + Math.floor(Math.random() * 50);
+
       this.context = await this.browser.newContext({
         storageState: storageStateObject,
-        viewport: { width: 1920, height: 1080 },
+        viewport: { width: randomWidth, height: randomHeight },
+        deviceScaleFactor: 1,
       });
+
+      // [新增] 注入动态反指纹脚本 (在页面加载前执行)
+      const stealthScript = this._generateStealthScript(authIndex);
+      await this.context.addInitScript(stealthScript);
+
+
       this.page = await this.context.newPage();
+      // [修复] 移除导致报错的启动参数，改用纯 JS 方式唤醒窗口
+      // ============================================================
+      try {
+        // 1. Playwright API 尝试置顶
+        await this.page.bringToFront();
+
+        // 2. 注入 JS 强制获取焦点 (这通常能让任务栏图标闪烁或弹出)
+        await this.page.evaluate(() => {
+          window.focus();
+        });
+
+        // 3. 模拟鼠标在页面左上角轻微晃动并点击
+        // 这能欺骗操作系统，让它认为这个窗口是当前活跃窗口
+        await this._humanMouseMove(this.page, 10, 10);
+        await this.page.mouse.down();
+        await this.page.waitForTimeout(100);
+        await this.page.mouse.up();
+
+        this.logger.info("[Browser] ⚡ 已通过 JS 强制唤醒窗口并获取焦点。");
+      } catch (e) {
+        this.logger.warn(`[Browser] 窗口唤醒尝试遇到轻微错误 (不影响运行): ${e.message}`);
+      }
       this.page.on("console", (msg) => {
         const msgText = msg.text();
         if (msgText.includes("[ProxyClient]")) {
@@ -294,8 +752,29 @@ class BrowserManager {
         waitUntil: "domcontentloaded",
       });
       this.logger.info("[Browser] 页面加载完成。");
+      try {
+        // 强制将页面置于前台（即使是无头模式，这也会触发 focus 事件）
+        await this.page.bringToFront();
 
-      await this.page.waitForTimeout(3000);
+        // 2. 模拟人类鼠标移动轨迹 (steps: 20 表示分20步移动过去，不再是瞬移)
+        // 移动到左上角安全区域 (10, 10)，避免误触中间的按钮
+        await this._humanMouseMove(this.page, 10, 10);
+
+        // 3. 模拟点击，并在按下和抬起之间增加随机延迟 (50ms - 150ms)
+        await this.page.mouse.down();
+        // Point 2: 随机等待时间
+        await this.page.waitForTimeout(50 + Math.random() * 150);
+        await this.page.mouse.up();
+
+        // 4. 再次轻微移动鼠标，证明是活人
+        await this._humanMouseMove(this.page, 100, 100);
+
+        this.logger.info("[Browser] ✅ 已执行拟人化页面激活 (轨迹移动+随机延迟点击)。");
+      } catch (e) {
+        this.logger.warn(`[Browser] 页面激活操作异常 (非致命): ${e.message}`);
+      }
+      // Point 2: 随机等待
+      await this.page.waitForTimeout(2000 + Math.random() * 2000);
 
       const currentUrl = this.page.url();
       let pageTitle = "";
@@ -327,7 +806,7 @@ class BrowserManager {
         pageTitle.includes("not available")
       ) {
         throw new Error(
-          "🚨 当前 IP 不支持访问 Google AI Studio。请更换节点后重启！"
+          "🚨 当前 IP 不支持访问 Google AI Studio (地区受限/送中)。Claw 节点可能被识别为受限地区，请尝试重启容器获取新IP。"
         );
       }
 
@@ -345,91 +824,46 @@ class BrowserManager {
         );
       }
 
-      this.logger.info(
-        `[Browser] 进入 20秒 检查流程 (目标: Cookie + Got it + 新手引导)...`
-      );
-
-      const startTime = Date.now();
-      const timeLimit = 20000;
-
-      // 状态记录表
-      const popupStatus = {
-        cookie: false,
-        gotIt: false,
-        guide: false,
-      };
-
-      while (Date.now() - startTime < timeLimit) {
-        // 如果3个都处理过了，立刻退出 ---
-        if (popupStatus.cookie && popupStatus.gotIt && popupStatus.guide) {
-          this.logger.info(
-            `[Browser] ⚡ 完美！3个弹窗全部处理完毕，提前进入下一步。`
-          );
-          break;
+      this.logger.info(`[Browser] 正在检查 Cookie 同意横幅...`);
+      try {
+        const agreeButton = this.page.locator('button:text("Agree")');
+        // Point 2: 随机等待
+        if (await agreeButton.isVisible({ timeout: 5000 })) {
+          await this.page.waitForTimeout(500 + Math.random() * 1000);
+          await agreeButton.click({ force: true });
+          this.logger.info(`[Browser] ✅ 点击了 "Agree"`);
         }
-
-        let clickedInThisLoop = false;
-
-        // 1. 检查 Cookie "Agree" (如果还没点过)
-        if (!popupStatus.cookie) {
-          try {
-            const agreeBtn = this.page.locator('button:text("Agree")').first();
-            if (await agreeBtn.isVisible({ timeout: 100 })) {
-              await agreeBtn.click({ force: true });
-              this.logger.info(`[Browser] ✅ (1/3) 点击了 "Cookie Agree"`);
-              popupStatus.cookie = true;
-              clickedInThisLoop = true;
-            }
-          } catch (e) {}
-        }
-
-        // 2. 检查 "Got it" (如果还没点过)
-        if (!popupStatus.gotIt) {
-          try {
-            const gotItBtn = this.page
-              .locator('div.dialog button:text("Got it")')
-              .first();
-            if (await gotItBtn.isVisible({ timeout: 100 })) {
-              await gotItBtn.click({ force: true });
-              this.logger.info(`[Browser] ✅ (2/3) 点击了 "Got it" 弹窗`);
-              popupStatus.gotIt = true;
-              clickedInThisLoop = true;
-            }
-          } catch (e) {}
-        }
-
-        // 3. 检查 新手引导 "Close" (如果还没点过)
-        if (!popupStatus.guide) {
-          try {
-            const closeBtn = this.page
-              .locator('button[aria-label="Close"]')
-              .first();
-            if (await closeBtn.isVisible({ timeout: 100 })) {
-              await closeBtn.click({ force: true });
-              this.logger.info(`[Browser] ✅ (3/3) 点击了 "新手引导关闭" 按钮`);
-              popupStatus.guide = true;
-              clickedInThisLoop = true;
-            }
-          } catch (e) {}
-        }
-
-        // 如果本轮点击了按钮，稍微等一下动画；如果没点，等待1秒避免死循环空转
-        await this.page.waitForTimeout(clickedInThisLoop ? 500 : 1000);
+      } catch (error) {
+        this.logger.info(`[Browser] 未发现 Cookie 同意横幅，跳过。`);
       }
 
-      this.logger.info(
-        `[Browser] 弹窗检查结束 (耗时: ${Math.round(
-          (Date.now() - startTime) / 1000
-        )}s)，结果: ` +
-          `Cookie[${popupStatus.cookie ? "Ok" : "No"}], ` +
-          `GotIt[${popupStatus.gotIt ? "Ok" : "No"}], ` +
-          `Guide[${popupStatus.guide ? "Ok" : "No"}]`
-      );
+      this.logger.info(`[Browser] 正在检查 "Got it" 弹窗...`);
+      try {
+        const gotItButton = this.page.locator(
+          'div.dialog button:text("Got it")'
+        );
+        await gotItButton.waitFor({ state: "visible", timeout: 15000 });
+        this.logger.info(`[Browser] ✅ 发现 "Got it" 弹窗，正在点击...`);
+        await gotItButton.click({ force: true });
+        await this.page.waitForTimeout(1000);
+      } catch (error) {
+        this.logger.info(`[Browser] 未发现 "Got it" 弹窗，跳过。`);
+      }
 
-      this.logger.info(
-        `[Browser] 弹窗清理阶段结束，准备进入 Code 按钮点击流程。`
-      );
+      this.logger.info(`[Browser] 正在检查新手引导...`);
+      try {
+        const closeButton = this.page.locator('button[aria-label="Close"]');
+        await closeButton.waitFor({ state: "visible", timeout: 15000 });
+        this.logger.info(`[Browser] ✅ 发现新手引导弹窗，正在点击关闭按钮...`);
+        await closeButton.click({ force: true });
+        await this.page.waitForTimeout(1000);
+      } catch (error) {
+        this.logger.info(
+          `[Browser] 未发现 "It's time to build" 新手引导，跳过。`
+        );
+      }
 
+      this.logger.info("[Browser] 准备UI交互，强行移除所有可能的遮罩层...");
       await this.page.evaluate(() => {
         const overlays = document.querySelectorAll("div.cdk-overlay-backdrop");
         if (overlays.length > 0) {
@@ -440,21 +874,22 @@ class BrowserManager {
         }
       });
 
-      this.logger.info('[Browser] (步骤1/5) 准备点击 "Code" 按钮...');
+      this.logger.info('[Browser] (步骤1/5) 准备点击 "Code" 按钮 (启动智能交互)...');
+      let clickSuccess = false;
       for (let i = 1; i <= 5; i++) {
         try {
-          this.logger.info(`  [尝试 ${i}/5] 清理遮罩层并点击...`);
+          this.logger.info(`  [尝试 ${i}/5] 清理遮罩层并尝试点击...`);
+          // 先清理一次遮罩
           await this.page.evaluate(() => {
-            document
-              .querySelectorAll("div.cdk-overlay-backdrop")
-              .forEach((el) => el.remove());
+            document.querySelectorAll("div.cdk-overlay-backdrop").forEach((el) => el.remove());
           });
           await this.page.waitForTimeout(500);
 
-          await this.page
-            .locator('button:text("Code")')
-            .click({ timeout: 10000 });
+          // 调用智能点击
+          await this._smartClickCode(this.page);
+
           this.logger.info("  ✅ 点击成功！");
+          clickSuccess = true;
           break;
         } catch (error) {
           this.logger.warn(
@@ -510,7 +945,7 @@ class BrowserManager {
       await this.page.waitForTimeout(250);
 
       this.logger.info("[Browser] (步骤3/5) 编辑器已显示，聚焦并粘贴脚本...");
-      await editorContainerLocator.click({ timeout: 30000 });
+      await editorContainerLocator.click({ timeout: 300000 });
 
       await this.page.evaluate(
         (text) => navigator.clipboard.writeText(text),
@@ -523,15 +958,10 @@ class BrowserManager {
       this.logger.info(
         '[Browser] (步骤5/5) 正在点击 "Preview" 按钮以使脚本生效...'
       );
-      await this.page.locator('button:text("Preview")').click();
+      await this.page.locator('button:text("Preview")').click({ timeout: 300000 });
       this.logger.info("[Browser] ✅ UI交互完成，脚本已开始运行。");
-      this.currentAuthIndex = authIndex;
-      this._startBackgroundWakeup();
-      this.logger.info("[Browser] (后台任务) 🛡️ 监控进程已启动...");
-      await this.page.waitForTimeout(1000);
-      this.logger.info(
-        "[Browser] ⚡ 正在发送主动唤醒请求以触发 Launch 流程..."
-      );
+      // [新增] 作者的主动唤醒逻辑，用于尽早触发 "Launch" 流程
+      this.logger.info("[Browser] ⚡ 正在发送主动唤醒请求以触发 Launch 流程...");
       try {
         await this.page.evaluate(async () => {
           try {
@@ -543,23 +973,22 @@ class BrowserManager {
               }
             );
           } catch (e) {
-            console.log(
-              "[ProxyClient] 主动唤醒请求已发送 (预期内可能会失败，这很正常)"
-            );
+            console.log("[ProxyClient] 主动唤醒请求已发送 (预期内可能会失败，这很正常)");
           }
         });
         this.logger.info("[Browser] ⚡ 主动唤醒请求已发送。");
       } catch (e) {
-        this.logger.warn(
-          `[Browser] 主动唤醒请求发送异常 (不影响主流程): ${e.message}`
-        );
+        this.logger.warn(`[Browser] 主动唤醒请求发送异常 (不影响主流程): ${e.message}`);
       }
 
+      // [新增] 页面初始化全部完成后，启动后台清道夫
+      this._startScavenger();
+      this._startBackgroundWakeup(); // 作者的 "Launch" 定向处理器
+      this.currentAuthIndex = authIndex;
       this.logger.info("==================================================");
       this.logger.info(`✅ [Browser] 账号 ${authIndex} 的上下文初始化成功！`);
       this.logger.info("✅ [Browser] 浏览器客户端已准备就绪。");
       this.logger.info("==================================================");
-      this._startBackgroundWakeup();
     } catch (error) {
       this.logger.error(
         `❌ [Browser] 账户 ${authIndex} 的上下文初始化失败: ${error.message}`
@@ -570,9 +999,14 @@ class BrowserManager {
       }
       throw error;
     }
+
   }
 
   async closeBrowser() {
+    if (this.scavengerInterval) {
+      clearInterval(this.scavengerInterval);
+      this.scavengerInterval = null;
+    }
     if (this.browser) {
       this.logger.info("[Browser] 正在关闭整个浏览器实例...");
       await this.browser.close();
@@ -591,217 +1025,6 @@ class BrowserManager {
     this.logger.info(
       `✅ [Browser] 账号切换完成，当前账号: ${this.currentAuthIndex}`
     );
-  }
-
-  async _startBackgroundWakeup() {
-    const currentPage = this.page;
-    await new Promise((r) => setTimeout(r, 1500));
-    if (!currentPage || currentPage.isClosed() || this.page !== currentPage)
-      return;
-    this.logger.info("[Browser] (后台任务) 🛡️ 网页保活监控已启动");
-    while (
-      currentPage &&
-      !currentPage.isClosed() &&
-      this.page === currentPage
-    ) {
-      try {
-        // --- [增强步骤 1] 强制唤醒页面 (解决不发请求不刷新的问题) ---
-        await currentPage.bringToFront().catch(() => {});
-
-        // 关键：在无头模式下，仅仅 bringToFront 可能不够，需要伪造鼠标移动来触发渲染帧
-        // 随机在一个无害区域轻微晃动鼠标
-        await currentPage.mouse.move(10, 10);
-        await currentPage.mouse.move(20, 20);
-
-        // --- [增强步骤 2] 智能查找 (查找文本并向上锁定可交互父级) ---
-        const targetInfo = await currentPage.evaluate(() => {
-          // 1. 直接CSS定位
-          try {
-            const preciseCandidates = Array.from(
-              document.querySelectorAll(
-                ".interaction-modal p, .interaction-modal button"
-              )
-            );
-            for (const el of preciseCandidates) {
-              const text = (el.innerText || "").trim();
-              if (/Launch|rocket_launch/i.test(text)) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                  return {
-                    found: true,
-                    x: rect.left + rect.width / 2,
-                    y: rect.top + rect.height / 2,
-                    tagName: el.tagName,
-                    text: text.substring(0, 15),
-                    strategy: "precise_css", // 标记：这是通过精准CSS找到的
-                  };
-                }
-              }
-            }
-          } catch (e) {}
-          // 2. 扫描Y轴400-800范围刻意元素
-          const MIN_Y = 400;
-          const MAX_Y = 800;
-
-          // 辅助函数：判断元素是否可见且在区域内
-          const isValid = (rect) => {
-            return (
-              rect.width > 0 &&
-              rect.height > 0 &&
-              rect.top > MIN_Y &&
-              rect.top < MAX_Y
-            );
-          };
-
-          // 扫描所有包含关键词的元素
-          const candidates = Array.from(
-            document.querySelectorAll("button, span, div, a, i")
-          );
-
-          for (const el of candidates) {
-            const text = (el.innerText || "").trim();
-            // 匹配 Launch 或 rocket_launch 图标名
-            if (!/Launch|rocket_launch/i.test(text)) continue;
-
-            let targetEl = el;
-            let rect = targetEl.getBoundingClientRect();
-
-            // [关键优化] 如果当前元素很小或是纯文本容器，尝试向上找 3 层父级
-            let parentDepth = 0;
-            while (parentDepth < 3 && targetEl.parentElement) {
-              if (
-                targetEl.tagName === "BUTTON" ||
-                targetEl.getAttribute("role") === "button"
-              ) {
-                break;
-              }
-              const parent = targetEl.parentElement;
-              const pRect = parent.getBoundingClientRect();
-              if (isValid(pRect)) {
-                targetEl = parent;
-                rect = pRect;
-              }
-              parentDepth++;
-            }
-
-            // 最终检查
-            if (isValid(rect)) {
-              return {
-                found: true,
-                x: rect.left + rect.width / 2,
-                y: rect.top + rect.height / 2,
-                tagName: targetEl.tagName,
-                text: text.substring(0, 15),
-                strategy: "fuzzy_scan", // 标记：这是通过模糊扫描找到的
-              };
-            }
-          }
-          return { found: false };
-        });
-
-        // --- [增强步骤 3] 执行操作 ---
-        if (targetInfo.found) {
-          this.noButtonCount = 0;
-          this.logger.info(
-            `[Browser] 🎯 锁定目标 [${targetInfo.tagName}] (策略: ${
-              targetInfo.strategy === "precise_css" ? "精准定位" : "模糊扫描"
-            })...`
-          );
-
-          // === 策略 A: 物理点击 (模拟真实鼠标) ===
-          // 1. 移动过去
-          await currentPage.mouse.move(targetInfo.x, targetInfo.y, {
-            steps: 5,
-          });
-          // 2. 悬停 (给 hover 样式一点反应时间)
-          await new Promise((r) => setTimeout(r, 300));
-          // 3. 按下
-          await currentPage.mouse.down();
-          // 4. 长按 (某些按钮防误触，需要按住一小会儿)
-          await new Promise((r) => setTimeout(r, 400));
-          // 5. 抬起
-          await currentPage.mouse.up();
-
-          this.logger.info(`[Browser] 🖱️ 物理点击已执行，验证结果...`);
-          // 等待 1.5 秒看效果
-          await new Promise((r) => setTimeout(r, 1500));
-
-          // === 策略 B: JS 补刀 (如果物理点击失败) ===
-          // 再次检查按钮是否还在原地
-          const isStillThere = await currentPage.evaluate(() => {
-            // 逻辑同上，简单检查
-            const allText = document.body.innerText;
-            // 简单粗暴检查页面可视区是否还有那个特定位置的文字
-            // 这里为了性能做简化：再次扫描元素
-            const els = Array.from(
-              document.querySelectorAll('button, span, div[role="button"]')
-            );
-            return els.some((el) => {
-              const r = el.getBoundingClientRect();
-              return (
-                /Launch|rocket_launch/i.test(el.innerText) &&
-                r.top > 400 &&
-                r.top < 800 &&
-                r.height > 0
-              );
-            });
-          });
-
-          if (isStillThere) {
-            this.logger.warn(
-              `[Browser] ⚠️ 物理点击似乎无效（按钮仍在），尝试 JS 强力点击...`
-            );
-
-            // 直接在浏览器内部触发 click 事件
-            await currentPage.evaluate(() => {
-              const MIN_Y = 400;
-              const MAX_Y = 800;
-              const candidates = Array.from(
-                document.querySelectorAll('button, span, div[role="button"]')
-              );
-              for (const el of candidates) {
-                const r = el.getBoundingClientRect();
-                if (
-                  /Launch|rocket_launch/i.test(el.innerText) &&
-                  r.top > MIN_Y &&
-                  r.top < MAX_Y
-                ) {
-                  // 尝试找到最近的 button 父级点击
-                  let target = el;
-                  if (target.closest("button"))
-                    target = target.closest("button");
-                  target.click(); // 原生 JS 点击
-                  console.log(
-                    "[ProxyClient] JS Click triggered on " + target.tagName
-                  );
-                  return true;
-                }
-              }
-            });
-            await new Promise((r) => setTimeout(r, 2000));
-          } else {
-            this.logger.info(`[Browser] ✅ 物理点击成功，按钮已消失。`);
-            await new Promise((r) => setTimeout(r, 60000));
-            this.noButtonCount = 21;
-          }
-        } else {
-          this.noButtonCount++;
-          // 5. [关键] 智能休眠逻辑 (支持被唤醒)
-          if (this.noButtonCount > 20) {
-            for (let i = 0; i < 30; i++) {
-              if (this.noButtonCount === 0) {
-                break;
-              }
-              await new Promise((r) => setTimeout(r, 1000));
-            }
-          } else {
-            await new Promise((r) => setTimeout(r, 1500));
-          }
-        }
-      } catch (e) {
-        await new Promise((r) => setTimeout(r, 1000));
-      }
-    }
   }
 }
 
@@ -828,6 +1051,7 @@ class LoggingService {
     }
 
     return formatted;
+
   }
 
   info(message) {
@@ -922,6 +1146,7 @@ class ConnectionRegistry extends EventEmitter {
       this.logger.error(`[Server] 内部WebSocket连接错误: ${error.message}`)
     );
     this.emit("connectionAdded", websocket);
+
   }
 
   _removeConnection(websocket) {
@@ -942,6 +1167,7 @@ class ConnectionRegistry extends EventEmitter {
     // --- 修改结束 ---
 
     this.emit("connectionRemoved", websocket);
+
   }
 
   _handleIncomingMessage(messageData) {
@@ -1048,6 +1274,7 @@ class RequestHandler {
 
     const nextIndexInArray = (currentIndexInArray + 1) % available.length;
     return available[nextIndexInArray];
+
   }
 
   async _switchToNextAuth() {
@@ -1143,6 +1370,7 @@ class RequestHandler {
       this.isAuthSwitching = false;
       this.isSystemBusy = false;
     }
+
   }
 
   async _switchToSpecificAuth(targetIndex) {
@@ -1178,6 +1406,7 @@ class RequestHandler {
       this.isAuthSwitching = false;
       this.isSystemBusy = false;
     }
+
   }
 
   async _handleRequestFailureAndSwitch(errorDetails, res) {
@@ -1237,6 +1466,7 @@ class RequestHandler {
 
       return;
     }
+
   }
 
   async processRequest(req, res) {
@@ -1356,6 +1586,7 @@ class RequestHandler {
         this.needsSwitchingAfterRequest = false;
       }
     }
+
   }
 
   async processOpenAIRequest(req, res) {
@@ -1364,10 +1595,22 @@ class RequestHandler {
     }
     const requestId = this._generateRequestId();
     const isOpenAIStream = req.body.stream === true;
-    const model = req.body.model || "gemini-1.5-pro-latest";
+    let model = req.body.model || "gemini-1.5-pro-latest";
     const systemStreamMode = this.serverSystem.streamingMode;
     const useRealStream = isOpenAIStream && systemStreamMode === "real";
+    // 从模型名称中解析思考模式指令
+    const modelMatch = model.match(/^(.*?)@thinking(\((.*?)\))?$/);
+    if (modelMatch) {
+      model = modelMatch[1]; // 提取并使用清理后的模型名称
+      const level = modelMatch[3]; // 提取level, e.g., "high" or undefined
 
+      // 将解析出的指令临时附加到请求体中，以便翻译函数使用
+      req.body.thinking_override = {
+        enabled: true,
+        level: level, // level可以是undefined, "default", 或具体等级
+      };
+      req.body.model = model; // 更新请求体中的模型名称为清理后的名称
+    }
     if (this.config.switchOnUses > 0) {
       this.usageCount++;
       this.logger.info(
@@ -1596,6 +1839,7 @@ class RequestHandler {
         res.end();
       }
     }
+
   }
 
   // --- 新增一个辅助方法，用于发送取消指令 ---
@@ -1635,7 +1879,7 @@ class RequestHandler {
 
       if (!bodyObj.generationConfig.thinkingConfig) {
         this.logger.info(
-          `[Proxy] ⚠️ (Google原生格式) 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig...`
+          `[Proxy] ⚡ (Google原生格式) 推理已启用（客户端未提供配置），正在注入 thinkingConfig...`
         );
         bodyObj.generationConfig.thinkingConfig = { includeThoughts: true };
       } else {
@@ -1659,6 +1903,7 @@ class RequestHandler {
       request_id: requestId,
       streaming_mode: this.serverSystem.streamingMode,
     };
+
   }
   _forwardRequest(proxyRequest) {
     const connection = this.connectionRegistry.getFirstConnection();
@@ -1741,8 +1986,7 @@ class RequestHandler {
           ) {
             // 只有在不是“用户取消”的情况下，才打印“尝试失败”的警告
             this.logger.warn(
-              `[Request] 尝试 #${attempt} 失败: 收到 ${
-                lastMessage.status || "未知"
+              `[Request] 尝试 #${attempt} 失败: 收到 ${lastMessage.status || "未知"
               } 错误。 - ${lastMessage.message}`
             );
           }
@@ -1802,7 +2046,7 @@ class RequestHandler {
         this.logger.info(
           `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${proxyRequest.request_id}`
         );
-      } catch (e) {}
+      } catch (e) { }
       res.write("data: [DONE]\n\n");
     } catch (error) {
       this._handleRequestError(error, res);
@@ -1815,6 +2059,7 @@ class RequestHandler {
         `[Request] 响应处理结束，请求ID: ${proxyRequest.request_id}`
       );
     }
+
   }
 
   async _handleRealStreamResponse(proxyRequest, messageQueue, res) {
@@ -1879,7 +2124,7 @@ class RequestHandler {
             );
           }
         }
-      } catch (e) {}
+      } catch (e) { }
     } catch (error) {
       if (error.message !== "Queue timeout") throw error;
       this.logger.warn("[Request] 真流式响应超时，可能流已正常结束。");
@@ -1889,6 +2134,7 @@ class RequestHandler {
         `[Request] 真流式响应连接已关闭，请求ID: ${proxyRequest.request_id}`
       );
     }
+
   }
 
   async _handleNonStreamResponse(proxyRequest, messageQueue, res) {
@@ -1986,7 +2232,7 @@ class RequestHandler {
         this.logger.info(
           `✅ [Request] 响应结束，原因: ${finishReason}，请求ID: ${proxyRequest.request_id}`
         );
-      } catch (e) {}
+      } catch (e) { }
 
       // 4. 设置正确的JSON响应头，并一次性发送处理过的全部数据
       res
@@ -1998,6 +2244,7 @@ class RequestHandler {
     } catch (error) {
       this._handleRequestError(error, res);
     }
+
   }
 
   _getKeepAliveChunk(req) {
@@ -2143,64 +2390,62 @@ class RequestHandler {
       stopSequences: openaiBody.stop,
     };
 
-    const extraBody = openaiBody.extra_body || {};
-    let rawThinkingConfig =
-      extraBody.google?.thinking_config ||
-      extraBody.google?.thinkingConfig ||
-      extraBody.thinkingConfig ||
-      extraBody.thinking_config ||
-      openaiBody.thinkingConfig ||
-      openaiBody.thinking_config;
-
     let thinkingConfig = null;
 
-    if (rawThinkingConfig) {
-      // 2. 格式清洗：将 snake_case (下划线) 转换为 camelCase (驼峰)
-      thinkingConfig = {};
+    // --- 新的思考配置逻辑 ---
+    let enableThinking = false;
+    let thinkingLevel = null;
 
-      // 处理开关
-      if (rawThinkingConfig.include_thoughts !== undefined) {
-        thinkingConfig.includeThoughts = rawThinkingConfig.include_thoughts;
-      } else if (rawThinkingConfig.includeThoughts !== undefined) {
-        thinkingConfig.includeThoughts = rawThinkingConfig.includeThoughts;
+    // 优先级 1: 检查是否存在从模型名称解析出的覆盖指令
+    if (openaiBody.thinking_override?.enabled) {
+      this.logger.info(`[Adapter] ⚡ 从模型名称中检测到思考模式指令...`);
+      enableThinking = true;
+      thinkingLevel = openaiBody.thinking_override.level; // 值可以是 "high", undefined, 或 "default"
+      delete openaiBody.thinking_override; // 清理临时属性
+    }
+    // 优先级 2: 如果模型名没有指令，则回退到检查请求体中的配置 (为了兼容性)
+    else {
+      const extraBody = openaiBody.extra_body || {};
+      const rawThinkingConfig = extraBody.google?.thinking_config || extraBody.google?.thinkingConfig || extraBody.thinkingConfig || extraBody.thinking_config || openaiBody.thinkingConfig || openaiBody.thinking_config;
+      const reasoningEffort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
+
+      if (rawThinkingConfig) {
+        enableThinking = rawThinkingConfig.include_thoughts ?? rawThinkingConfig.includeThoughts ?? true;
+        if (enableThinking) {
+          thinkingLevel = rawThinkingConfig.thinking_level ?? rawThinkingConfig.thinkingLevel ?? rawThinkingConfig.level;
+        }
+      } else if (reasoningEffort) {
+        enableThinking = true;
+        thinkingLevel = reasoningEffort;
       }
-
-      // 处理 Budget (预算)
-      // if (rawThinkingConfig.thinking_budget !== undefined) {
-      // thinkingConfig.thinkingBudgetTokenLimit =
-      // rawThinkingConfig.thinking_budget;
-      //} else if (rawThinkingConfig.thinkingBudget !== undefined) {
-      //thinkingConfig.thinkingBudgetTokenLimit =
-      //rawThinkingConfig.thinkingBudget;
-      //}
-
-      this.logger.info(
-        `[Adapter] 成功提取并转换推理配置: ${JSON.stringify(thinkingConfig)}`
-      );
+      // 注意: 此处已移除了 "else if (this.serverSystem.forceThinking)"，不再依赖全局配置
     }
 
-    // 3. 如果没找到配置，尝试识别 OpenAI 标准参数 'reasoning_effort'
-    if (!thinkingConfig) {
-      const effort = openaiBody.reasoning_effort || extraBody.reasoning_effort;
-      if (effort) {
-        this.logger.info(
-          `[Adapter] 检测到 OpenAI 标准推理参数 (reasoning_effort: ${effort})，自动转换为 Google 格式。`
-        );
-        thinkingConfig = { includeThoughts: true };
-      }
-    }
-
-    // 4. 强制开启逻辑 (WebUI开关)
-    if (this.serverSystem.forceThinking && !thinkingConfig) {
-      this.logger.info(
-        "[Adapter] ⚠️ 强制推理已启用，且客户端未提供配置，正在注入 thinkingConfig..."
-      );
+    // 根据最终判断结果来构建 thinkingConfig
+    if (enableThinking) {
       thinkingConfig = { includeThoughts: true };
+      const isV3Model = /gemini-3|gemini-exp-new/i.test(modelName);
+
+      if (isV3Model) {
+        // 只有当 thinkingLevel 被显式提供且不是 'default' 时，才设置具体的 level
+        if (thinkingLevel && thinkingLevel !== 'default') {
+          thinkingConfig.thinkingLevel = thinkingLevel.toUpperCase();
+          this.logger.info(`[Adapter] 模型 ${modelName} (V3 模式) 已启用思考模式，并设置等级: ${thinkingConfig.thinkingLevel}`);
+        } else {
+          // 对于 @thinking 或 @thinking(default)，只开启思考，不设置任何等级
+          this.logger.info(`[Adapter] 模型 ${modelName} (V3 模式) 已启用思考模式 (默认，无等级)。`);
+        }
+      } else {
+        // 非V3模型也只开启思考，不设置等级
+        this.logger.info(`[Adapter] 模型 ${modelName} (非 V3 模式) 已启用思考模式 (无等级)。`);
+      }
     }
+    // --- 逻辑结束 ---
 
     // 5. 写入最终配置
     if (thinkingConfig) {
       generationConfig.thinkingConfig = thinkingConfig;
+      this.logger.info(`[Adapter] 最终注入的思考配置: ${JSON.stringify(thinkingConfig)}`);
     }
 
     googleRequest.generationConfig = generationConfig;
@@ -2212,9 +2457,38 @@ class RequestHandler {
       { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
       { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
     ];
+    if (this.serverSystem.forceWebSearch || this.serverSystem.forceUrlContext) {
+      if (!googleRequest.tools) {
+        googleRequest.tools = [];
+      }
 
+      const toolsToAdd = [];
+
+      // 处理 Google 搜索
+      if (this.serverSystem.forceWebSearch) {
+        const hasSearch = googleRequest.tools.some(t => t.googleSearch);
+        if (!hasSearch) {
+          googleRequest.tools.push({ googleSearch: {} });
+          toolsToAdd.push("googleSearch");
+        }
+      }
+
+      // 处理网址上下文
+      if (this.serverSystem.forceUrlContext) {
+        const hasUrlContext = googleRequest.tools.some(t => t.urlContext);
+        if (!hasUrlContext) {
+          googleRequest.tools.push({ urlContext: {} });
+          toolsToAdd.push("urlContext");
+        }
+      }
+
+      if (toolsToAdd.length > 0) {
+        this.logger.info(`[Adapter] ⚠️ 根据配置，强制注入工具: [${toolsToAdd.join(", ")}]`);
+      }
+    }
     this.logger.info("[Adapter] 翻译完成。");
     return googleRequest;
+
   }
 
   _translateGoogleToOpenAIStream(googleChunk, modelName = "gemini-pro") {
@@ -2312,6 +2586,7 @@ class RequestHandler {
     };
 
     return `data: ${JSON.stringify(openaiResponse)}\n\n`;
+
   }
 }
 
@@ -2322,8 +2597,9 @@ class ProxyServerSystem extends EventEmitter {
     this._loadConfiguration(); // 这个函数会执行下面的_loadConfiguration
     this.streamingMode = this.config.streamingMode;
 
-    this.forceThinking = false;
-
+    this.forceThinking = this.config.forceThinking;
+    this.forceWebSearch = this.config.forceWebSearch;
+    this.forceUrlContext = this.config.forceUrlContext;
     this.authSource = new AuthSource(this.logger);
     this.browserManager = new BrowserManager(
       this.logger,
@@ -2342,6 +2618,7 @@ class ProxyServerSystem extends EventEmitter {
 
     this.httpServer = null;
     this.wsServer = null;
+
   }
 
   // ===== 所有函数都已正确放置在类内部 =====
@@ -2349,6 +2626,8 @@ class ProxyServerSystem extends EventEmitter {
   _loadConfiguration() {
     let config = {
       httpPort: 7860,
+      thinkingLevels: null,
+      defaultThinkingLevel: "high",
       host: "0.0.0.0",
       wsPort: 9998,
       streamingMode: "real",
@@ -2359,14 +2638,20 @@ class ProxyServerSystem extends EventEmitter {
       browserExecutablePath: null,
       apiKeys: [],
       immediateSwitchStatusCodes: [429, 503],
-      // [新增] 用于追踪API密钥来源
       apiKeySource: "未设置",
+      forceThinking: false, // 默认为关闭，除非配置文件说是 true
+      forceWebSearch: false,
+      forceUrlContext: false,
     };
 
     const configPath = path.join(__dirname, "config.json");
     try {
       if (fs.existsSync(configPath)) {
         const fileConfig = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+        if (fileConfig.thinkingLevels) {
+          config.thinkingLevels = { ...config.thinkingLevels, ...fileConfig.thinkingLevels };
+          delete fileConfig.thinkingLevels; // 删除以免下面直接覆盖出错
+        }
         config = { ...config, ...fileConfig };
         this.logger.info("[System] 已从 config.json 加载配置。");
       }
@@ -2459,30 +2744,40 @@ class ProxyServerSystem extends EventEmitter {
       config.modelList = ["gemini-1.5-pro-latest"]; // 出错时也使用备用模型
     }
 
+    if (!config.thinkingLevels || !config.thinkingLevels.low) {
+      this.logger.error("❌ [致命配置错误] config.json 中未找到或未正确配置 'thinkingLevels' 对象！");
+      this.logger.error("   请确保 config.json 包含如下结构：");
+      this.logger.error('   "thinkingLevels": { "low": 4096, "medium": 16384, "high": 32768 }');
+      // 在生产环境中，这里应该直接 throw new Error(...) 来阻止服务启动
+      // 为了调试方便，我们注入一个临时的安全值并继续，但会打印错误
+      config.thinkingLevels = { low: 4096, medium: 16384, high: 32768 };
+      this.logger.warn("[System] 已注入临时的 thinkingLevels 默认值以防止崩溃。请立即修复您的 config.json！");
+    }
+
     this.config = config;
+    this.logger.info(`  强制推理默认状态: ${this.config.forceThinking ? "开启" : "关闭"}`);
+    this.logger.info(`  强制Web搜索: ${this.config.forceWebSearch ? "开启" : "关闭"}`);
+    this.logger.info(`  强制网址上下文: ${this.config.forceUrlContext ? "开启" : "关闭"}`);
     this.logger.info("================ [ 生效配置 ] ================");
     this.logger.info(`  HTTP 服务端口: ${this.config.httpPort}`);
     this.logger.info(`  监听地址: ${this.config.host}`);
     this.logger.info(`  流式模式: ${this.config.streamingMode}`);
     this.logger.info(
-      `  轮换计数切换阈值: ${
-        this.config.switchOnUses > 0
-          ? `每 ${this.config.switchOnUses} 次请求后切换`
-          : "已禁用"
+      `  轮换计数切换阈值: ${this.config.switchOnUses > 0
+        ? `每 ${this.config.switchOnUses} 次请求后切换`
+        : "已禁用"
       }`
     );
     this.logger.info(
-      `  失败计数切换: ${
-        this.config.failureThreshold > 0
-          ? `失败${this.config.failureThreshold} 次后切换`
-          : "已禁用"
+      `  失败计数切换: ${this.config.failureThreshold > 0
+        ? `失败${this.config.failureThreshold} 次后切换`
+        : "已禁用"
       }`
     );
     this.logger.info(
-      `  立即切换报错码: ${
-        this.config.immediateSwitchStatusCodes.length > 0
-          ? this.config.immediateSwitchStatusCodes.join(", ")
-          : "已禁用"
+      `  立即切换报错码: ${this.config.immediateSwitchStatusCodes.length > 0
+        ? this.config.immediateSwitchStatusCodes.join(", ")
+        : "已禁用"
       }`
     );
     this.logger.info(`  单次请求最大重试: ${this.config.maxRetries}次`);
@@ -2491,14 +2786,12 @@ class ProxyServerSystem extends EventEmitter {
     this.logger.info(
       "============================================================="
     );
+
   }
 
   async start(initialAuthIndex = null) {
     // <<<--- 1. 重新接收参数
     this.logger.info("[System] 开始弹性启动流程...");
-    await this._startHttpServer();
-    await this._startWebSocketServer();
-    this.logger.info("[System] 准备加载浏览器...");
     const allAvailableIndices = this.authSource.availableIndices;
 
     if (allAvailableIndices.length === 0) {
@@ -2551,8 +2844,13 @@ class ProxyServerSystem extends EventEmitter {
       // 如果所有账号都尝试失败了
       throw new Error("所有认证源均尝试失败，服务器无法启动。");
     }
+
+    // 只有在浏览器成功启动后，才启动网络服务
+    await this._startHttpServer();
+    await this._startWebSocketServer();
     this.logger.info(`[System] 代理服务器系统启动完成。`);
     this.emit("started");
+
   }
 
   _createAuthMiddleware() {
@@ -2580,8 +2878,7 @@ class ProxyServerSystem extends EventEmitter {
 
       if (clientKey && serverApiKeys.includes(clientKey)) {
         this.logger.info(
-          `[Auth] API Key验证通过 (来自: ${
-            req.headers["x-forwarded-for"] || req.ip
+          `[Auth] API Key验证通过 (来自: ${req.headers["x-forwarded-for"] || req.ip
           })`
         );
         if (req.query.key) {
@@ -2606,6 +2903,7 @@ class ProxyServerSystem extends EventEmitter {
         },
       });
     };
+
   }
 
   async _startHttpServer() {
@@ -2622,13 +2920,13 @@ class ProxyServerSystem extends EventEmitter {
           `[System] HTTP服务器已在 http://${this.config.host}:${this.config.httpPort} 上监听`
         );
         this.logger.info(
-          `[System] Keep-Alive 超时已设置为 ${
-            this.httpServer.keepAliveTimeout / 1000
+          `[System] Keep-Alive 超时已设置为 ${this.httpServer.keepAliveTimeout / 1000
           } 秒。`
         );
         resolve();
       });
     });
+
   }
 
   _createExpressApp() {
@@ -2694,9 +2992,8 @@ class ProxyServerSystem extends EventEmitter {
       <style>body{display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;background:#f0f2f5}form{background:white;padding:40px;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1);text-align:center}input{width:250px;padding:10px;margin-top:10px;border:1px solid #ccc;border-radius:5px}button{width:100%;padding:10px;background-color:#007bff;color:white;border:none;border-radius:5px;margin-top:20px;cursor:pointer}.error{color:red;margin-top:10px}</style>
       </head><body><form action="/login" method="post"><h2>请输入 API Key</h2>
       <input type="password" name="apiKey" placeholder="API Key" required autofocus><button type="submit">登录</button>
-      ${
-        req.query.error ? '<p class="error">API Key 错误!</p>' : ""
-      }</form></body></html>`;
+      ${req.query.error ? '<p class="error">API Key 错误!</p>' : ""
+        }</form></body></html>`;
       res.send(loginHtml);
     });
     app.post("/login", (req, res) => {
@@ -2774,38 +3071,33 @@ class ProxyServerSystem extends EventEmitter {
         <h1>代理服务状态 <span class="dot" title="数据动态刷新中..."></span></h1>
         <div id="status-section">
             <pre>
+
 <span class="label">服务状态</span>: <span class="status-ok">Running</span>
-<span class="label">浏览器连接</span>: <span class="${
-        browserManager.browser ? "status-ok" : "status-error"
-      }">${!!browserManager.browser}</span>
+<span class="label">浏览器连接</span>: <span class="${browserManager.browser ? "status-ok" : "status-error"
+        }">${!!browserManager.browser}</span>
 --- 服务配置 ---
-<span class="label">流模式</span>: ${
-        config.streamingMode
-      } (仅启用流式传输时生效)
-<span class="label">强制推理</span>: ${
-        this.forceThinking ? "✅ 已启用" : "❌ 已关闭"
-      }
-<span class="label">立即切换 (状态码)</span>: ${
-        config.immediateSwitchStatusCodes.length > 0
+<span class="label">流模式</span>: ${config.streamingMode
+        } (仅启用流式传输时生效)
+<span class="label">强制推理</span>: ${this.forceThinking ? "✅ 已启用" : "❌ 已关闭"
+        }
+<span class="label">立即切换 (状态码)</span>: ${config.immediateSwitchStatusCodes.length > 0
           ? `[${config.immediateSwitchStatusCodes.join(", ")}]`
           : "已禁用"
-      }
+        }
 <span class="label">API 密钥</span>: ${config.apiKeySource}
 --- 账号状态 ---
 <span class="label">当前使用账号</span>: #${requestHandler.currentAuthIndex}
-<span class="label">使用次数计数</span>: ${requestHandler.usageCount} / ${
-        config.switchOnUses > 0 ? config.switchOnUses : "N/A"
-      }
-<span class="label">连续失败计数</span>: ${requestHandler.failureCount} / ${
-        config.failureThreshold > 0 ? config.failureThreshold : "N/A"
-      }
+<span class="label">使用次数计数</span>: ${requestHandler.usageCount} / ${config.switchOnUses > 0 ? config.switchOnUses : "N/A"
+        }
+<span class="label">连续失败计数</span>: ${requestHandler.failureCount} / ${config.failureThreshold > 0 ? config.failureThreshold : "N/A"
+        }
 <span class="label">扫描到的总帐号</span>: [${initialIndices.join(
-        ", "
-      )}] (总数: ${initialIndices.length})
+          ", "
+        )}] (总数: ${initialIndices.length})
       ${accountDetailsHtml}
 <span class="label">格式错误 (已忽略)</span>: [${invalidIndices.join(
-        ", "
-      )}] (总数: ${invalidIndices.length})
+          ", "
+        )}] (总数: ${invalidIndices.length})
             </pre>
         </div>
         <div id="actions-section" style="margin-top: 2em;">
@@ -2845,6 +3137,7 @@ class ProxyServerSystem extends EventEmitter {
                     accountDetailsHtml + '\\n' +
                     '<span class="label">格式错误 (已忽略)</span>: ' + data.status.invalidIndices;
                 
+
                 const logContainer = document.getElementById('log-container');
                 const logTitle = document.querySelector('#log-section h2');
                 const isScrolledToBottom = logContainer.scrollHeight - logContainer.clientHeight <= logContainer.scrollTop + 1;
@@ -2853,7 +3146,7 @@ class ProxyServerSystem extends EventEmitter {
                 if (isScrolledToBottom) { logContainer.scrollTop = logContainer.scrollHeight; }
             }).catch(error => console.error('Error fetching new content:', error));
         }
-
+    
         function switchSpecificAccount() {
             const selectElement = document.getElementById('accountIndexSelect');
             const targetIndex = selectElement.value;
@@ -2877,9 +3170,8 @@ class ProxyServerSystem extends EventEmitter {
         }
             
         function toggleStreamingMode() { 
-            const newMode = prompt('请输入新的流模式 (real 或 fake):', '${
-              this.config.streamingMode
-            }');
+            const newMode = prompt('请输入新的流模式 (real 或 fake):', '${this.config.streamingMode
+        }');
             if (newMode === 'fake' || newMode === 'real') {
                 fetch('/api/set-mode', { 
                     method: 'POST', 
@@ -2892,7 +3184,7 @@ class ProxyServerSystem extends EventEmitter {
                 alert('无效的模式！请只输入 "real" 或 "fake"。'); 
             } 
         }
-
+    
         function toggleForceThinking() {
             fetch('/api/toggle-force-thinking', { 
                 method: 'POST', 
@@ -2901,7 +3193,7 @@ class ProxyServerSystem extends EventEmitter {
             .then(res => res.text()).then(data => { alert(data); updateContent(); })
             .catch(err => alert('设置失败: ' + err));
         }
-
+    
         document.addEventListener('DOMContentLoaded', () => {
             updateContent(); 
             setInterval(updateContent, 5000);
@@ -2940,19 +3232,15 @@ class ProxyServerSystem extends EventEmitter {
               : "已禁用",
           apiKeySource: config.apiKeySource,
           currentAuthIndex: requestHandler.currentAuthIndex,
-          usageCount: `${requestHandler.usageCount} / ${
-            config.switchOnUses > 0 ? config.switchOnUses : "N/A"
-          }`,
-          failureCount: `${requestHandler.failureCount} / ${
-            config.failureThreshold > 0 ? config.failureThreshold : "N/A"
-          }`,
-          initialIndices: `[${initialIndices.join(", ")}] (总数: ${
-            initialIndices.length
-          })`,
+          usageCount: `${requestHandler.usageCount} / ${config.switchOnUses > 0 ? config.switchOnUses : "N/A"
+            }`,
+          failureCount: `${requestHandler.failureCount} / ${config.failureThreshold > 0 ? config.failureThreshold : "N/A"
+            }`,
+          initialIndices: `[${initialIndices.join(", ")}] (总数: ${initialIndices.length
+            })`,
           accountDetails: accountDetails,
-          invalidIndices: `[${invalidIndices.join(", ")}] (总数: ${
-            invalidIndices.length
-          })`,
+          invalidIndices: `[${invalidIndices.join(", ")}] (总数: ${invalidIndices.length
+            })`,
         },
         logs: logs.join("\n"),
         logCount: logs.length,
@@ -3046,6 +3334,7 @@ class ProxyServerSystem extends EventEmitter {
     });
 
     return app;
+
   }
 
   async _startWebSocketServer() {
@@ -3081,4 +3370,3 @@ if (require.main === module) {
 }
 
 module.exports = { ProxyServerSystem, BrowserManager, initializeServer };
-
